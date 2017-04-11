@@ -1,0 +1,5 @@
+/build/
+/mbed.bld
+/.project
+*.hg_archival.txt
+*.cproject
