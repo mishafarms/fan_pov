@@ -26,12 +26,18 @@
 #include "soc/gpio_struct.h"
 #include "driver/gpio.h"
 
+#define ESP_INTR_FLAG_DEFAULT 0
+
 #if __cplusplus
 extern "C" {
 	void app_main();
 	extern void timer_app_main();
 	extern void gpio_app_main();
 };
+#else
+void app_main();
+extern void timer_app_main();
+//extern void gpio_app_main();
 #endif
 
 /*
@@ -60,11 +66,18 @@ extern "C" {
 #define PIN_NUM_CLK  GPIO_NUM_14
 //#define PIN_NUM_CS   GPIO_NUM_22
 
+#if 0
 #define PIN_NUM_VMOSI GPIO_NUM_23
 #define PIN_NUM_VCLK  GPIO_NUM_18
+#else
+#define PIN_NUM_VMOSI GPIO_NUM_5
+#define PIN_NUM_VCLK  GPIO_NUM_16
+#endif
 
 #define PIN_NUM_DC   GPIO_NUM_25
 #define PIN_NUM_DB   GPIO_NUM_26
+
+#define PIN_NUM_CYCLE GPIO_NUM_12
 
 spi_device_handle_t spi;
 spi_device_handle_t vspi;
@@ -77,7 +90,7 @@ spi_device_handle_t vspi;
 //set the D/C line to the value indicated in the user field.
 void ili_spi_pre_transfer_callback(spi_transaction_t *t)
 {
-	gpio_num_t gpio_num = (gpio_num_t) t->user;
+	gpio_num_t gpio_num = (gpio_num_t) t;
 
 	if (gpio_num)
 	{
@@ -87,7 +100,7 @@ void ili_spi_pre_transfer_callback(spi_transaction_t *t)
 
 void ili_spi_post_transfer_callback(spi_transaction_t *t)
 {
-	gpio_num_t gpio_num = (gpio_num_t) t->user;
+	gpio_num_t gpio_num = (gpio_num_t) t;
 
 	if (gpio_num)
 	{
@@ -100,11 +113,9 @@ void ili_spi_post_transfer_callback(spi_transaction_t *t)
 
 static spi_transaction_t trans[7];
 static spi_transaction_t vspi_trans[7];
-static uint32_t two_off_leds[2] = {0x000000ff, 0x000000ff};
-//static uint32_t zeros[2] = {0xa0a055aa, 0x0f050a04};
-static uint32_t zeros[16] = {0, 0, 0, 0};
 
-uint32_t leds[100 * 16] = {};
+extern uint32_t leds[];
+extern void cycle_isr(void* arg);
 
 //Initialize the display
 void ili_init(spi_device_handle_t spi)
@@ -134,6 +145,29 @@ void ili_init(spi_device_handle_t spi)
 //    gpio_set_direction(PIN_NUM_RST, GPIO_MODE_OUTPUT);
 //    gpio_set_direction(PIN_NUM_BCKL, GPIO_MODE_OUTPUT);
 
+    // setup the pin to sample cycle times
+#if 1
+    gpio_set_direction(PIN_NUM_CYCLE, GPIO_MODE_INPUT);
+
+    //interrupt on positive edge
+    io_conf.intr_type = (gpio_int_type_t) GPIO_PIN_INTR_POSEDGE;
+    //set as output mode
+    io_conf.mode = GPIO_MODE_INPUT;
+    //bit mask of the pins that you want to set,e.g.GPIO18/19
+    io_conf.pin_bit_mask = GPIO_SEL_12;
+    //disable pull-down mode
+    io_conf.pull_down_en = (gpio_pulldown_t) 0;
+    //disable pull-up mode
+    io_conf.pull_up_en = (gpio_pullup_t) 0;
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+
+    //install gpio isr service
+    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+    //hook isr handler for specific gpio pin
+    gpio_isr_handler_add(PIN_NUM_CYCLE, cycle_isr, (void*) PIN_NUM_CYCLE);
+#endif
+
     for (x=0; x<6; x++) {
         memset(&trans[x], 0, sizeof(spi_transaction_t));
         memset(&vspi_trans[x], 0, sizeof(spi_transaction_t));
@@ -146,7 +180,7 @@ void ili_init(spi_device_handle_t spi)
     trans[0].flags = SPI_TRANS_DEFER_START;
     trans[0].length=32;
     trans[0].user = (void *) PIN_NUM_DB;
-    trans[0].tx_buffer = (void *) zeros;
+//    trans[0].tx_buffer = (void *) zeros;
     trans[0].next = &trans[1];
 
     for (x=1; x<4; x++)
@@ -156,7 +190,7 @@ void ili_init(spi_device_handle_t spi)
     }
 
     trans[4].length=32;
-    trans[4].tx_buffer = (void *) two_off_leds;
+//    trans[4].tx_buffer = (void *) two_off_leds;
     trans[4].next = (struct spi_transaction_t *) NULL;
 
     // do the same for vspi except we only have 2 blades of LEDS
@@ -164,7 +198,7 @@ void ili_init(spi_device_handle_t spi)
     vspi_trans[0].flags = SPI_TRANS_DEFER_START;
     vspi_trans[0].length=32;
     vspi_trans[0].user = (void *) PIN_NUM_DC;	// use a differnt pin to debug
-    vspi_trans[0].tx_buffer = (void *) zeros;
+//    vspi_trans[0].tx_buffer = (void *) zeros;
     vspi_trans[0].next = &vspi_trans[1];
 
     for (x=1; x<3; x++)
@@ -174,15 +208,30 @@ void ili_init(spi_device_handle_t spi)
     }
 
     vspi_trans[3].length=32;
-    vspi_trans[3].tx_buffer = (void *) two_off_leds;
+//    vspi_trans[3].tx_buffer = (void *) two_off_leds;
     vspi_trans[3].next = (struct spi_transaction_t *) NULL;
 
     for (int y = 0; y < 100; y++)
     {
-    	for (x = 0; x < 16; x++)
+    	int bits = y;
+
+    	for (x = 0; x < 8; x++)
     	{
+    		uint8_t data;
+
     		// first set the high byte to 0xff as per the APA102 spec
-    		leds[(y * 16) + x] =  (0xff) | (y << 8) | (0xff << 16) | (x << 24);
+//    		leds[(y * 16) + x] =  (0xff) | (y << 8) | (0xff << 16) | (x << 24);
+    		if ( bits & 0x80)
+    		{
+    			data = 0x80;
+    		}
+    		else
+    		{
+    			data = 0x0;
+    		}
+    		bits <<= 1;
+
+    		leds[(y * 16) + x] =  (0xff) | (data << 8) | (data << 16) | (data << 24);
     	}
     }
 }
@@ -194,18 +243,24 @@ void db_prt(int len)
 
 void db_pulse(void)
 {
-	GPIO.out_w1ts = 1 << 15;
-	GPIO.out_w1tc = 1 << 15;
+	GPIO.out_w1ts = 1 << 25;
+	GPIO.out_w1tc = 1 << 25;
+}
+
+void dc_pulse(void)
+{
+	GPIO.out_w1ts = 1 << 26;
+	GPIO.out_w1tc = 1 << 26;
 }
 
 void db_on(void)
 {
-	GPIO.out_w1ts = 1 << 15;
+	GPIO.out_w1ts = 1 << 25;
 }
 
 void db_off(void)
 {
-	GPIO.out_w1tc = 1 << 15;
+	GPIO.out_w1tc = 1 << 25;
 }
 
 void db_prtn(int len, void *trans, void *next)
@@ -275,11 +330,17 @@ void send_line_finish(spi_device_handle_t spi)
     }
 }
 
-void start_all_spi(spi_device_handle_t spi1, spi_device_handle_t spi2)
+int32_t start_all_spi(void)
 {
-    esp_err_t ret;
-    ret=pov_spi_start(spi1, spi2);
-    assert(ret==ESP_OK);
+    return(pov_spi_start(spi, vspi));
+}
+
+void IRAM_ATTR kick_all(void)
+{
+	// please keep these in this order
+
+	pov_kick_start(vspi);
+    pov_kick_start(spi);
 }
 
 void app_main()
@@ -333,23 +394,40 @@ void app_main()
     ili_init(spi);
     //Go do nice stuff.
 
-//    timer_app_main();
 //    gpio_app_main();
 
-    for (int i=0; i< 100000; i++)
-    {
-    	static int _line = 0;
+	vTaskDelay(100);
 
+#if 0
+    printf("about to kickstart vspi\n");
+    pov_kick_start(vspi);
+    printf("about to kickstart spi\n");
+    pov_kick_start(spi);
+#endif
+
+    timer_app_main();
+
+    for (int x = 0; ;x++)
+    {
     	vTaskDelay(100);
 
-    	send_all_lines(spi, _line);
-    	send_all_lines(vspi, _line);
-
     	// I am going to defer the start
-    	start_all_spi(spi, vspi);
 
-    	send_line_finish(spi);
-    	send_line_finish(vspi);
+    	// This should set a new cycle
+//    	cycle_isr();
+
+//    	printf("cycle time %d\n", cycles[x % 4]);
+//    	timer_set_new_alarm(cycles[x % 4]);
+
+    	// keep these in this order please
+
+//    	printf("going to kick all\n");
+//    	kick_all();
+
+//        pov_kick_start(vspi);
+//        pov_kick_start(spi);
+
+//    	start_all_spi();
 
  //  		printf("The Hall effect sens is %d\n", hall_sensor_read());
 
