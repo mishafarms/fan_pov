@@ -2,7 +2,7 @@
  * pov_spi.c
  *
  *  Created on: Mar 5, 2017
- *      Author: micro
+ *      Author: mishafarms
  */
 
 // Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
@@ -78,6 +78,8 @@ extern void db_off(void);
 extern void db_prt(int);
 extern void db_prtn(int, void *, void *);
 
+#define IS_FIRST_SPI(sp) ((sp)->hw == &SPI2)
+
 typedef struct {
     spi_device_t *device[NO_CS];
     intr_handle_t intr;
@@ -85,8 +87,8 @@ typedef struct {
     spi_transaction_t *cur_trans;
     int cur_cs;
     lldesc_t dmadesc_tx[POV_SPI_MAX_DMA_CHAIN];
-	lldesc_t dmadesc_rx;
     bool no_gpio_matrix;
+    bool inited;
 } spi_host_t;
 
 struct spi_device_t {
@@ -98,13 +100,20 @@ struct spi_device_t {
 
 static spi_host_t *spihost[3];
 
-
 static const char *SPI_TAG = "povspi_master";
 #define SPI_CHECK(a, str, ret_val) \
     if (!(a)) { \
         ESP_LOGE(SPI_TAG,"%s(%d): %s", __FUNCTION__, __LINE__, str); \
         return (ret_val); \
     }
+
+static uint32_t two_off_leds[2] = {0x000000ff, 0x000000ff};
+static uint32_t zeros[2] = {0, 0};
+
+uint32_t leds[NUM_POV_LINES * NUM_LEDS_PER_LINE] = {};
+
+
+int lineNum = 0;
 
 /*
  Stores a bunch of per-spi-peripheral data.
@@ -468,66 +477,54 @@ static void spi_set_clock(spi_dev_t *hw, int fapb, int hz, int duty_cycle) {
 static void IRAM_ATTR pov_spi_intr(void *arg)
 {
     int i;
-    int prevCs=-1;
-    BaseType_t r;
-    BaseType_t do_yield=pdFALSE;
-    spi_transaction_t *trans=NULL;
     spi_host_t *host=(spi_host_t*)arg;
     int total_len = 0;
+    int numLedStrands = 0;
 
-    //Ignore all but the trans_done int.
-    if (!host->hw->slave.trans_done) return;
+	//Ignore all but the trans_done int.
+    if (!host->hw->slave.trans_done)
+    {
+    	// This is really bad and shouldn't be ignored (I am not turning off the interrupt enable like they did)
+    	return;
+    }
 
-    if (host->cur_trans) {
-        //Okay, transaction is done.
-        if ((host->cur_trans->rx_buffer || (host->cur_trans->flags & SPI_TRANS_USE_RXDATA)) && host->cur_trans->rxlength<=THRESH_DMA_TRANS) {
-            //Need to copy from SPI regs to result buffer.
-            uint32_t *data;
-            if (host->cur_trans->flags & SPI_TRANS_USE_RXDATA) {
-                data=(uint32_t*)&host->cur_trans->rx_data[0];
-            } else {
-                data=(uint32_t*)host->cur_trans->rx_buffer;
-            }
-            for (int x=0; x < host->cur_trans->rxlength; x+=32) {
-                //Do a memcpy to get around possible alignment issues in rx_buffer
-                uint32_t word=host->hw->data_buf[x/32];
-                memcpy(&data[x/32], &word, 4);
-            }
-        }
-        //Call post-transaction callback, if any
-        if (host->device[host->cur_cs]->cfg.post_cb) host->device[host->cur_cs]->cfg.post_cb(host->cur_trans);
-        //Return transaction descriptor.
-        xQueueSendFromISR(host->device[host->cur_cs]->ret_queue, &host->cur_trans, &do_yield);
-        host->cur_trans=NULL;
-        prevCs=host->cur_cs;
+    // we can get here because 1 of 2 DMA channels is finished.
+
+    // stop the pain, clear the int bit
+
+    host->hw->slave.trans_done=0;
+
+    //because we are dealing with LEDS I am going to totally ignore the rx part of this
+
+    // we do a slightly different setup depending on which DMA channel this is. I am using
+    //Call post-transaction callback, if any
+    if (host->device[host->cur_cs]->cfg.post_cb)
+    {
+//    	host->device[host->cur_cs]->cfg.post_cb(IS_FIRST_SPI(host) ? 25 : 26);
     }
-    //ToDo: This is a stupidly simple low-cs-first priority scheme. Make this configurable somehow. - JD
-    for (i=0; i<NO_CS; i++) {
-        if (host->device[i]) {
-            r=xQueueReceiveFromISR(host->device[i]->trans_queue, &trans, &do_yield);
-            //Stop looking if we have a transaction to send.
-            if (r) break;
-        }
+
+    // if the lineNum is >= MAX_LINES then do nothing here
+
+    if (lineNum > NUM_POV_LINES)
+    {
+    	return;
     }
-    if (i==NO_CS) {
-        //No packet waiting. Disable interrupt.
-        esp_intr_disable(host->intr);
-    } else {
-        host->hw->slave.trans_done=0; //clear int bit
+
+    /* so we are going to setup the DMA for the next line of LEDS, it will be triggered by a timer interrupt to occur
+     * at a synchronized time.
+     */
+
+    {
         //We have a transaction. Send it.
-        spi_device_t *dev=host->device[i];
-        host->cur_trans=trans;
-        host->cur_cs=i;
+        spi_device_t *dev=host->device[0];
         //We should be done with the transmission.
-        assert(host->hw->cmd.usr == 0);
-
-        //Default rxlength to be the same as length, if not filled in.
-        if (trans->rxlength==0) {
-            trans->rxlength=trans->length;
-        }
+//        assert(host->hw->cmd.usr == 0);
 
         //Reconfigure according to device settings, but only if we change CSses.
-        if (i!=prevCs) {
+        if (!host->inited)
+        {
+        	int x;
+
             //Assumes a hardcoded 80MHz Fapb for now. ToDo: figure out something better once we have
             //clock scaling working.
             int apbclk=APB_CLK_FREQ;
@@ -574,10 +571,48 @@ static void IRAM_ATTR pov_spi_intr(void *arg)
             host->hw->user.cs_hold=(dev->cfg.cs_ena_posttrans)?1:0;
 
             //Configure CS pin
-            host->hw->pin.cs0_dis=(i==0)?0:1;
-            host->hw->pin.cs1_dis=(i==1)?0:1;
-            host->hw->pin.cs2_dis=(i==2)?0:1;
+            host->hw->pin.cs0_dis=1;
+            host->hw->pin.cs1_dis=1;
+            host->hw->pin.cs2_dis=1;
+
+            // the DMA chain will look almost always the same. So set it up now
+
+        	host->dmadesc_tx[0].length = 4;
+        	host->dmadesc_tx[0].size = 4 ;
+        	host->dmadesc_tx[0].buf = (uint8_t*) &zeros;
+        	host->dmadesc_tx[0].eof = 1;
+        	host->dmadesc_tx[0].sosf = 0;
+        	host->dmadesc_tx[0].empty = (uint32_t)(&host->dmadesc_tx[1]);
+
+        	if (IS_FIRST_SPI(host))
+        	{
+        		numLedStrands = 3;
+        	}
+        	else
+        	{
+        		numLedStrands = 2;
+        	}
+
+        	for (x = 1 ; x < (numLedStrands + 1) ; x++)
+        	{
+            	host->dmadesc_tx[x].length = NUM_LEDS_PER_LINE * 4;
+            	host->dmadesc_tx[x].size = NUM_LEDS_PER_LINE * 4;
+            	// we can't really set the buffer as that is what will change
+            	host->dmadesc_tx[x].eof = 1;
+            	host->dmadesc_tx[x].sosf = 0;
+            	host->dmadesc_tx[x].empty = (uint32_t)(&host->dmadesc_tx[x + 1]);
+        	}
+
+        	host->dmadesc_tx[x].length = 4;
+        	host->dmadesc_tx[x].size = 4 ;
+        	host->dmadesc_tx[x].buf = (uint8_t*) &two_off_leds;
+        	host->dmadesc_tx[x].eof = 1;
+        	host->dmadesc_tx[x].sosf = 0;
+        	host->dmadesc_tx[x].empty = (uint32_t) NULL;
+
+        	host->inited = true;
         }
+
         //Reset DMA
         host->hw->dma_conf.val |= SPI_OUT_RST|SPI_AHBM_RST|SPI_AHBM_FIFO_RST;
         host->hw->dma_out_link.start=0;
@@ -586,136 +621,113 @@ static void IRAM_ATTR pov_spi_intr(void *arg)
         //QIO/DIO
         host->hw->ctrl.val &= ~(SPI_FREAD_DUAL|SPI_FREAD_QUAD|SPI_FREAD_DIO|SPI_FREAD_QIO);
         host->hw->user.val &= ~(SPI_FWRITE_DUAL|SPI_FWRITE_QUAD|SPI_FWRITE_DIO|SPI_FWRITE_QIO);
-        if (trans->flags & SPI_TRANS_MODE_DIO) {
-            if (trans->flags & SPI_TRANS_MODE_DIOQIO_ADDR) {
-                host->hw->ctrl.fread_dio=1;
-                host->hw->user.fwrite_dio=1;
-            } else {
-                host->hw->ctrl.fread_dual=1;
-                host->hw->user.fwrite_dual=1;
-            }
-            host->hw->ctrl.fastrd_mode=1;
-        } else if (trans->flags & SPI_TRANS_MODE_QIO) {
-            if (trans->flags & SPI_TRANS_MODE_DIOQIO_ADDR) {
-                host->hw->ctrl.fread_qio=1;
-                host->hw->user.fwrite_qio=1;
-            } else {
-                host->hw->ctrl.fread_quad=1;
-                host->hw->user.fwrite_quad=1;
-            }
-            host->hw->ctrl.fastrd_mode=1;
-        }
 
+        // we are not using RX, so disable it here.
 
-        //Fill DMA descriptors
-        if (trans->rx_buffer || (trans->flags & SPI_TRANS_USE_RXDATA)) {
-            uint32_t *data;
-            if (trans->flags & SPI_TRANS_USE_RXDATA) {
-                data=(uint32_t *)&trans->rx_data[0];
-            } else {
-                data=trans->rx_buffer;
-            }
-            if (trans->rxlength <= THRESH_DMA_TRANS) {
-                //No need for DMA; we'll copy the result out of the work registers directly later.
-            } else {
-                host->hw->user.usr_miso_highpart=0;
-                host->dmadesc_rx.size=(trans->rxlength+7)/8;
-                host->dmadesc_rx.length=(trans->rxlength+7)/8;
-                host->dmadesc_rx.buf=(uint8_t*)data;
-                host->dmadesc_rx.eof=1;
-                host->dmadesc_rx.sosf=0;
-                host->dmadesc_rx.owner=1;
-                host->hw->dma_in_link.addr=(int)(&host->dmadesc_rx)&0xFFFFF;
-                host->hw->dma_in_link.start=1;
-            }
-            host->hw->user.usr_miso=1;
-        } else {
-            host->hw->user.usr_miso=0;
-        }
+        host->hw->user.usr_miso=0;
 
-        if (trans->tx_buffer || (trans->flags & SPI_TRANS_USE_TXDATA)) {
-            uint32_t *data;
-            if (trans->flags & SPI_TRANS_USE_TXDATA) {
-                data=(uint32_t *)&trans->tx_data[0];
-            } else {
-                data=(uint32_t *)trans->tx_buffer;
-            }
-            if ((trans->length <= THRESH_DMA_TRANS) && (trans->next == (struct spi_transaction_t *) NULL)) {
-                //No need for DMA.
-                for (int x=0; x < trans->length; x+=32) {
-                    //Use memcpy to get around alignment issues for txdata
-                    uint32_t word;
-                    memcpy(&word, &data[x/32], 4);
-                    host->hw->data_buf[(x/32)+8]=word;
-                }
-                host->hw->user.usr_mosi_highpart=1;
-            } else {
-            	struct spi_transaction_t *pTrans = trans;
+        // we need to figure out which host this is and then we can load the proper info
 
-                host->hw->user.usr_mosi_highpart=0;
-                // we need to build a chain
+        host->hw->user.usr_mosi_highpart=0;
 
-                for (int x = 0 ; (x < POV_SPI_MAX_DMA_CHAIN) && (pTrans != (struct spi_transaction_t *) NULL) ;
-                		x++, pTrans = pTrans->next)
-                {
-                	host->dmadesc_tx[x].length=(pTrans->length+7)/8;
-                	host->dmadesc_tx[x].size=(pTrans->length+7)/8;
-                	host->dmadesc_tx[x].buf=(uint8_t*)pTrans->tx_buffer;
-                	host->dmadesc_tx[x].eof=1;
-                	host->dmadesc_tx[x].sosf=0;
-                	host->dmadesc_tx[x].owner=1;
-                	host->dmadesc_tx[x].empty=
-                			(pTrans->next != (struct spi_transaction_t *) NULL) ? (uint32_t)(&host->dmadesc_tx[x + 1]) : (uint32_t) NULL;
-                	total_len += host->dmadesc_tx[x].length * 8; //turn it back into bits
-                }
-                host->hw->dma_out_link.addr=(int)(&host->dmadesc_tx[0]) & 0xFFFFF;
-                host->hw->dma_out_link.start=1;
-            }
-        }
-        host->hw->mosi_dlen.usr_mosi_dbitlen=((total_len == 0) ? trans->length : total_len)-1;
-        host->hw->miso_dlen.usr_miso_dbitlen=trans->rxlength-1;
-        host->hw->user2.usr_command_value=trans->command;
-        if (dev->cfg.address_bits>32) {
-            host->hw->addr=trans->address >> 32;
-            host->hw->slv_wr_status=trans->address & 0xffffffff;
-        } else {
-            host->hw->addr=trans->address & 0xffffffff;
-        }
-        host->hw->user.usr_mosi=(trans->tx_buffer==NULL)?0:1;
-        host->hw->user.usr_miso=(trans->rx_buffer==NULL)?0:1;
-
-        if ( (trans->flags & SPI_TRANS_DEFER_START) != SPI_TRANS_DEFER_START)
+        if (IS_FIRST_SPI(host))
         {
-        	//Call pre-transmission callback, if any
-        	if (dev->cfg.pre_cb) dev->cfg.pre_cb(trans);
-        	//Kick off transfer
-        	host->hw->cmd.usr=1;
+        	int x;
+        	// we need to figure out which line we are on and then grab the correct lines to display
+
+        	host->dmadesc_tx[0].owner = 1;
+
+        	for (x = 1 ; x < 4 ; x++)
+        	{
+        		int line = (((x - 1) * POV_LINE_OFFSET) + lineNum) % NUM_POV_LINES;
+
+//        		db_prt(line);
+
+        		host->dmadesc_tx[x].buf = (uint8_t *) (leds + (NUM_LEDS_PER_LINE * line));
+            	host->dmadesc_tx[x].owner = 1;
+        	}
+
+        	// set the owner bit of the last piece of the chain
+
+        	host->dmadesc_tx[x].owner = 1;
+
+        	total_len = 1600; // start 1 + 16 * 3 + stop 1 50 * 32 = 1600
+
+        	// increment once per cycle
+
+           ++lineNum;  // I am not going to do anything here. If the lineNum is >= NUM_POV_LINES, then do nothing
+
+//        	lineNum = 0;
+
         }
+        else
+        {
+        	int x;
+        	// we need to figure out which line we are on and then grab the correct lines to display
+
+        	host->dmadesc_tx[0].owner = 1;
+
+        	for (x = 1 ; x < 3 ; x++)
+        	{
+        		int line = (((x + 2) * POV_LINE_OFFSET) + lineNum) % NUM_POV_LINES;
+
+//        		db_prt(line);
+
+        		host->dmadesc_tx[x].buf = (uint8_t *) (leds + (NUM_LEDS_PER_LINE * line));
+            	host->dmadesc_tx[x].owner = 1;
+        	}
+
+        	// set the owner bit of the last piece of the chain
+
+        	host->dmadesc_tx[x].owner = 1;
+
+        	total_len = 1088; // start 1 + 16 * 2 + stop 1 34 * 32 = 1088
+        }
+
+        host->hw->dma_out_link.addr = (int)(&host->dmadesc_tx[0]) & 0xFFFFF;
+        host->hw->dma_out_link.start = 1;
+
+        host->hw->mosi_dlen.usr_mosi_dbitlen = total_len - 1;
+        host->hw->miso_dlen.usr_miso_dbitlen = 0;
+        host->hw->user2.usr_command_value = 0;
+
+        host->hw->addr = 0;
+
+        host->hw->user.usr_mosi = 1;
+        host->hw->user.usr_miso = 0;
     }
-    if (do_yield) portYIELD_FROM_ISR();
 }
 
-esp_err_t IRAM_ATTR pov_spi_start(spi_device_handle_t handle, spi_device_handle_t handle2)
+int32_t IRAM_ATTR pov_spi_start(spi_device_handle_t handle, spi_device_handle_t handle2)
 {
     spi_device_t *dev=handle->host->device[handle->host->cur_cs];
-    spi_transaction_t *trans=handle->host->cur_trans;
 
-    SPI_CHECK(handle!=NULL, "invalid dev handle", ESP_ERR_INVALID_ARG);
-    SPI_CHECK(handle2!=NULL, "invalid dev handle2", ESP_ERR_INVALID_ARG);
+//    SPI_CHECK(handle!=NULL, "invalid dev handle", ESP_ERR_INVALID_ARG);
+//    SPI_CHECK(handle2!=NULL, "invalid dev handle2", ESP_ERR_INVALID_ARG);
 
-    if (trans != NULL)
-    {
-    	//Call pre-transmission callback, if any
-    	if (dev->cfg.pre_cb)
-    	{
-    		dev->cfg.pre_cb(trans);
-    	}
-    }
+
+	//Call pre-transmission callback, if any
+	if (dev->cfg.pre_cb)
+	{
+//		dev->cfg.pre_cb(25);
+//		dev->cfg.pre_cb(26);
+	}
 
     //Kick off transfer
     handle->host->hw->cmd.usr=1;
     handle2->host->hw->cmd.usr=1;
 
+    return lineNum;
+}
+
+esp_err_t pov_kick_start(spi_device_handle_t handle)
+{
+//	if (IS_FIRST_SPI(handle->host))
+	{
+		lineNum = 0;
+	}
+	handle->host->hw->slave.trans_done = 1;
+    esp_intr_enable(handle->host->intr);
     return ESP_OK;
 }
 

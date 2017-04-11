@@ -25,7 +25,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-
+#define NUM_POV_LINES 100
+#define NUM_POV_PHYS_LINES 5
+#define NUM_LEDS_PER_LINE 16
+#define POV_LINE_OFFSET (NUM_POV_LINES / NUM_POV_PHYS_LINES)
 
 #ifdef __cplusplus
 extern "C"
@@ -198,6 +201,7 @@ esp_err_t pov_spi_bus_remove_device(spi_device_handle_t handle);
  *         - ESP_OK                on success
  */
 esp_err_t pov_spi_device_queue_trans(spi_device_handle_t handle, spi_transaction_t *trans_desc, TickType_t ticks_to_wait);
+esp_err_t pov_kick_start(spi_device_handle_t handle);
 
 
 /**
