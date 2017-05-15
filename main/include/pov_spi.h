@@ -30,6 +30,8 @@
 #define NUM_LEDS_PER_LINE 16
 #define POV_LINE_OFFSET (NUM_POV_LINES / NUM_POV_PHYS_LINES)
 
+#define NUM_BITS_PER_LED  32
+
 #ifdef __cplusplus
 extern "C"
 {

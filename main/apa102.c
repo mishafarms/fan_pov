@@ -61,34 +61,38 @@ extern void timer_app_main();
 
 */
 
-//#define PIN_NUM_MISO GPIO_NUM_21
+// These are the native pins for HSPI
 #define PIN_NUM_MOSI GPIO_NUM_13
 #define PIN_NUM_CLK  GPIO_NUM_14
 //#define PIN_NUM_CS   GPIO_NUM_22
 
 #if 0
+// These are the native pins for VSPI
 #define PIN_NUM_VMOSI GPIO_NUM_23
 #define PIN_NUM_VCLK  GPIO_NUM_18
 #else
+// my ESP32 did not have the above pins available. (redesigned board does)
 #define PIN_NUM_VMOSI GPIO_NUM_5
 #define PIN_NUM_VCLK  GPIO_NUM_16
 #endif
 
+#define LOGIC_DEBUG 1
+
+#if defined(LOGIC_DEBUG)
+// these are for debugging with a logic analyzer
 #define PIN_NUM_DC   GPIO_NUM_25
 #define PIN_NUM_DB   GPIO_NUM_26
+#endif
 
+// This is any GPIO pin.
 #define PIN_NUM_CYCLE GPIO_NUM_12
 
 spi_device_handle_t spi;
 spi_device_handle_t vspi;
 
-/*
- The ILI9341 needs a bunch of command/argument values to be initialized. They are stored in this struct.
-*/
-
 //This function is called (in irq context!) just before a transmission starts. It will
 //set the D/C line to the value indicated in the user field.
-void ili_spi_pre_transfer_callback(spi_transaction_t *t)
+void pov_spi_pre_transfer_callback(spi_transaction_t *t)
 {
 	gpio_num_t gpio_num = (gpio_num_t) t;
 
@@ -98,7 +102,7 @@ void ili_spi_pre_transfer_callback(spi_transaction_t *t)
 	}
 }
 
-void ili_spi_post_transfer_callback(spi_transaction_t *t)
+void pov_spi_post_transfer_callback(spi_transaction_t *t)
 {
 	gpio_num_t gpio_num = (gpio_num_t) t;
 
@@ -118,10 +122,11 @@ extern uint32_t leds[];
 extern void cycle_isr(void* arg);
 
 //Initialize the display
-void ili_init(spi_device_handle_t spi)
+void pov_init(spi_device_handle_t spi)
 {
     int x;
 
+#if defined(LOGIC_DEBUG)
     //Initialize non-SPI GPIOs
     gpio_set_direction(PIN_NUM_DC, GPIO_MODE_OUTPUT);
     gpio_set_direction(PIN_NUM_DB, GPIO_MODE_OUTPUT);
@@ -142,19 +147,18 @@ void ili_init(spi_device_handle_t spi)
 
     gpio_set_level(PIN_NUM_DB, 0);
     gpio_set_level(PIN_NUM_DC, 0);
-//    gpio_set_direction(PIN_NUM_RST, GPIO_MODE_OUTPUT);
-//    gpio_set_direction(PIN_NUM_BCKL, GPIO_MODE_OUTPUT);
+#endif
 
     // setup the pin to sample cycle times
-#if 1
+
     gpio_set_direction(PIN_NUM_CYCLE, GPIO_MODE_INPUT);
 
     //interrupt on positive edge
     io_conf.intr_type = (gpio_int_type_t) GPIO_PIN_INTR_POSEDGE;
-    //set as output mode
+    //set as input mode
     io_conf.mode = GPIO_MODE_INPUT;
     //bit mask of the pins that you want to set,e.g.GPIO18/19
-    io_conf.pin_bit_mask = GPIO_SEL_12;
+    io_conf.pin_bit_mask = (1 << PIN_NUM_CYCLE);
     //disable pull-down mode
     io_conf.pull_down_en = (gpio_pulldown_t) 0;
     //disable pull-up mode
@@ -165,8 +169,13 @@ void ili_init(spi_device_handle_t spi)
     //install gpio isr service
     gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
     //hook isr handler for specific gpio pin
+    /* this ISR measures how much time each cycle takes and get the average sets up the timer for the line interrupt and
+     * starts the LED DMA off. (basically everything related to the physical display
+     */
+
     gpio_isr_handler_add(PIN_NUM_CYCLE, cycle_isr, (void*) PIN_NUM_CYCLE);
-#endif
+
+    // initialize the SPI transactions
 
     for (x=0; x<6; x++) {
         memset(&trans[x], 0, sizeof(spi_transaction_t));
@@ -178,41 +187,51 @@ void ili_init(spi_device_handle_t spi)
     // setup the starting 32 bits of 0
 
     trans[0].flags = SPI_TRANS_DEFER_START;
-    trans[0].length=32;
+    trans[0].length=NUM_BITS_PER_LED;
+#if defined(LOGIC_DEBUG)
     trans[0].user = (void *) PIN_NUM_DB;
+#endif
+//    we don't do this here. We build the entire set of DMA transactions in the pov_spi.c file now
 //    trans[0].tx_buffer = (void *) zeros;
+
     trans[0].next = &trans[1];
 
     for (x=1; x<4; x++)
     {
-        trans[x].length=32 * 16;
+        trans[x].length= NUM_BITS_PER_LED * NUM_LEDS_PER_LINE;
         trans[x].next = &trans[x + 1];
     }
 
-    trans[4].length=32;
+    trans[4].length=NUM_BITS_PER_LED;
 //    trans[4].tx_buffer = (void *) two_off_leds;
     trans[4].next = (struct spi_transaction_t *) NULL;
 
     // do the same for vspi except we only have 2 blades of LEDS
 
     vspi_trans[0].flags = SPI_TRANS_DEFER_START;
-    vspi_trans[0].length=32;
+    vspi_trans[0].length=NUM_BITS_PER_LED;
+#if defined(LOGIC_DEBUG)
     vspi_trans[0].user = (void *) PIN_NUM_DC;	// use a differnt pin to debug
+#endif
+
 //    vspi_trans[0].tx_buffer = (void *) zeros;
     vspi_trans[0].next = &vspi_trans[1];
 
     for (x=1; x<3; x++)
     {
-    	vspi_trans[x].length=32 * 16;
+    	vspi_trans[x].length = NUM_BITS_PER_LED * NUM_LEDS_PER_LINE;
     	vspi_trans[x].next = &vspi_trans[x + 1];
     }
 
-    vspi_trans[3].length=32;
+    vspi_trans[3].length = NUM_BITS_PER_LED;
 //    vspi_trans[3].tx_buffer = (void *) two_off_leds;
     vspi_trans[3].next = (struct spi_transaction_t *) NULL;
 
-    for (int y = 0; y < 100; y++)
+    // this generates a pattern that is easy to see on the logic analyzer
+
+    for (int y = 0; y < NUM_POV_LINES; y++)
     {
+#if defined(LOGIC_DEBUG)
     	int bits = y;
 
     	for (x = 0; x < 8; x++)
@@ -220,7 +239,7 @@ void ili_init(spi_device_handle_t spi)
     		uint8_t data;
 
     		// first set the high byte to 0xff as per the APA102 spec
-//    		leds[(y * 16) + x] =  (0xff) | (y << 8) | (0xff << 16) | (x << 24);
+//    		leds[(y * NUM_LEDS_PER_LINE) + x] =  (0xff) | (y << 8) | (0xff << 16) | (x << 24);
     		if ( bits & 0x80)
     		{
     			data = 0x80;
@@ -231,8 +250,16 @@ void ili_init(spi_device_handle_t spi)
     		}
     		bits <<= 1;
 
-    		leds[(y * 16) + x] =  (0xff) | (data << 8) | (data << 16) | (data << 24);
+    		leds[(y * NUM_LEDS_PER_LINE) + x] =  (0xff) | (data << 8) | (data << 16) | (data << 24);
     	}
+#else
+    	// all off with the APA102 brightness set to 255.
+
+    	for (x = 0; x < 8; x++)
+    	{
+    		leds[(y * NUM_LEDS_PER_LINE) + x] =  (0xff);
+    	}
+#endif
     }
 }
 
@@ -241,32 +268,34 @@ void db_prt(int len)
 	printf("Total Len = %d\n", len);
 }
 
-void db_pulse(void)
-{
-	GPIO.out_w1ts = 1 << 25;
-	GPIO.out_w1tc = 1 << 25;
-}
-
-void dc_pulse(void)
-{
-	GPIO.out_w1ts = 1 << 26;
-	GPIO.out_w1tc = 1 << 26;
-}
-
-void db_on(void)
-{
-	GPIO.out_w1ts = 1 << 25;
-}
-
-void db_off(void)
-{
-	GPIO.out_w1tc = 1 << 25;
-}
-
 void db_prtn(int len, void *trans, void *next)
 {
 	printf("Total Len = %d trans = %p next = %p\n", len, trans, next);
 }
+
+#if defined(LOGIC_DEBUG)
+void db_pulse(void)
+{
+	GPIO.out_w1ts = 1 << PIN_NUM_DB;
+	GPIO.out_w1tc = 1 << PIN_NUM_DB;
+}
+
+void dc_pulse(void)
+{
+	GPIO.out_w1ts = 1 << PIN_NUM_DC;
+	GPIO.out_w1tc = 1 << PIN_NUM_DC;
+}
+
+void db_on(void)
+{
+	GPIO.out_w1ts = 1 << PIN_NUM_DB;
+}
+
+void db_off(void)
+{
+	GPIO.out_w1tc = 1 << PIN_NUM_DB;
+}
+#endif
 
 //To send a line we have to send a command, 2 data bytes, another command, 2 more data bytes and another command
 //before sending the line data itself; a total of 6 transactions. (We can't put all of this in just one transaction
@@ -285,7 +314,7 @@ void send_all_lines(spi_device_handle_t p_spi, uint8_t lineNum)
     	for (x=1; x<4; x++)
     	{
     		// starting at led 0 we have 4 bytes per led
-    		trans[x].tx_buffer = (void *) (leds + (16 * ((lineNum + ((x - 1) * 20)) % 100)));
+    		trans[x].tx_buffer = (void *) (leds + (NUM_LEDS_PER_LINE * ((lineNum + ((x - 1) * POV_LINE_OFFSET)) % NUM_POV_LINES)));
     	}
 
     	ret=pov_spi_device_queue_trans(p_spi, &trans[0], portMAX_DELAY);
@@ -301,7 +330,7 @@ void send_all_lines(spi_device_handle_t p_spi, uint8_t lineNum)
     	for (x=1; x<3; x++)
     	{
     		// starting at led 0 we have 4 bytes per led
-    		vspi_trans[x].tx_buffer = (void *) (leds + (16 * ((lineNum + ((x + 2) * 20)) % 100)));
+    		vspi_trans[x].tx_buffer = (void *) (leds + (NUM_LEDS_PER_LINE * ((lineNum + ((x + 2) * POV_LINE_OFFSET)) % NUM_POV_LINES)));
     	}
 
     	ret=pov_spi_device_queue_trans(p_spi, &vspi_trans[0], portMAX_DELAY);
@@ -353,8 +382,8 @@ void app_main()
     devcfg.mode=0;                                //SPI mode 0
     devcfg.spics_io_num=-1;               //CS pin
     devcfg.queue_size=10;                          //We want to be able to queue 7 transactions at a time
-    devcfg.pre_cb=ili_spi_pre_transfer_callback;  //Specify pre-transfer callback to handle D/C line
-    devcfg.post_cb=ili_spi_post_transfer_callback;  //Specify post-transfer callback to handle D/C line
+    devcfg.pre_cb=pov_spi_pre_transfer_callback;  //Specify pre-transfer callback to handle D/C line
+    devcfg.post_cb=pov_spi_post_transfer_callback;  //Specify post-transfer callback to handle D/C line
 
 	buscfg.miso_io_num=-1;
 	buscfg.mosi_io_num=PIN_NUM_MOSI;
@@ -391,7 +420,7 @@ void app_main()
     //Initialize the LCD
 
     printf("initing\n");
-    ili_init(spi);
+    pov_init(spi);
     //Go do nice stuff.
 
 //    gpio_app_main();
@@ -431,7 +460,7 @@ void app_main()
 
  //  		printf("The Hall effect sens is %d\n", hall_sensor_read());
 
-//    	_line = (_line + 1) % 100;
+//    	_line = (_line + 1) % NUM_POV_LINES;
     }
 }
 
